@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict
 import os
@@ -11,6 +12,18 @@ from sqlalchemy.orm import sessionmaker, relationship
 
 # ------------------- Setup -------------------
 app = FastAPI(title="Monastery360 Backend with SQLite & file_url")
+
+# Allow frontend dev server to access API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
@@ -80,6 +93,27 @@ def get_monasteries():
             "media": media_list
         })
     return result
+
+@app.get("/monasteries/{id}", response_model=Dict)
+def get_monastery(id: int):
+    db = next(get_db())
+    monastery = db.query(Monastery).filter(Monastery.id == id).first()
+    if not monastery:
+        raise HTTPException(status_code=404, detail="Monastery not found")
+
+    media_list = []
+    for md in monastery.media:
+        filename = os.path.basename(md.file_path)
+        file_url = f"http://127.0.0.1:8000/media/{filename}"
+        media_list.append({"title": md.title, "type": md.type, "file_url": file_url})
+
+    return {
+        "id": monastery.id,
+        "name": monastery.name,
+        "location": monastery.location,
+        "founded": monastery.founded,
+        "media": media_list,
+    }
 
 @app.post("/monasteries", response_model=Dict)
 def add_monastery(monastery: MonasteryIn):
