@@ -9,8 +9,10 @@ from uuid import uuid4
 import asyncio
 import requests
 from fastapi import Request
+from fastapi import Body
 
-from sqlalchemy import Column, Integer, String, ForeignKey, create_engine, Float, UniqueConstraint
+from sqlalchemy import Column, Integer, String, ForeignKey, create_engine, Float, UniqueConstraint, Text
+from sqlalchemy import text, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
@@ -20,12 +22,8 @@ app = FastAPI(title="Monastery360 Backend with SQLite & file_url")
 # Allow frontend dev server to access API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],
+    # Allow all origins in local development to support IDE preview proxy ports
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,6 +42,10 @@ DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'monastery360.db')}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+# Fixed origin for route planning: Sikkim Station (adjust as needed)
+STATION_LAT = 27.3389
+STATION_LNG = 88.6065
 
 # ------------------- Database Models -------------------
 class Monastery(Base):
@@ -65,6 +67,7 @@ class Media(Base):
     title = Column(String)
     type = Column(String)
     file_path = Column(String)
+    language = Column(String, nullable=True)  # optional media language code, e.g., 'en', 'hi'
     monastery = relationship("Monastery", back_populates="media")
 
 class MonasteryInfo(Base):
@@ -116,7 +119,36 @@ class AudioHighlight(Base):
     location = Column(String)
     monastery = relationship("Monastery", back_populates="highlights")
 
+class EmbeddingRow(Base):
+    __tablename__ = "embeddings"
+    id = Column(Integer, primary_key=True)
+    doc_type = Column(String)  # monastery|event|archive
+    doc_id = Column(Integer)
+    title = Column(String)
+    content = Column(Text)
+    vector = Column(Text)  # JSON string of list[float]
+
+class QaCache(Base):
+    __tablename__ = "qa_cache"
+    id = Column(Integer, primary_key=True)
+    question = Column(Text)
+    lang = Column(String, default="en")
+    answer = Column(Text)
+    citations = Column(Text)  # JSON string
+    created_at = Column(String)
+
 Base.metadata.create_all(bind=engine)
+# Best-effort migration: add 'language' column to media if it doesn't exist yet (SQLAlchemy 2.x compatible)
+try:
+    insp = inspect(engine)
+    cols = [c['name'] for c in insp.get_columns('media')]
+    if 'language' not in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE media ADD COLUMN language VARCHAR"))
+            conn.commit()
+except Exception:
+    # Column may already exist or inspect may fail; ignore
+    pass
 
 # ------------------- Pydantic Models -------------------
 class MonasteryIn(BaseModel):
@@ -162,6 +194,12 @@ class NarrationIn(BaseModel):
     voice: Optional[str] = "alloy"
     script: Optional[str] = None
 
+class NarrationMultiIn(BaseModel):
+    title: Optional[str] = "Audio Narration"
+    voice: Optional[str] = None  # if None, we will select based on language
+    script: Optional[str] = None  # source script (assumed EN if translation is needed)
+    target_lang: str = "en"  # BCP-47 or ISO code like 'en', 'hi', 'bn', 'ne'
+
 # ------------------- Dependency -------------------
 def get_db():
     db = SessionLocal()
@@ -170,14 +208,501 @@ def get_db():
     finally:
         db.close()
 
+# ------------------- Admin: Embeddings Snapshot -------------------
+@app.get("/admin/embeddings/export")
+def admin_embeddings_export():
+    db = SessionLocal()
+    try:
+        rows = db.query(EmbeddingRow).all()
+        import json as _json
+        data = [
+            {
+                "doc_type": r.doc_type,
+                "doc_id": r.doc_id,
+                "title": r.title,
+                "content": r.content,
+                "vector": r.vector,
+            }
+            for r in rows
+        ]
+        return {"items": data}
+    finally:
+        db.close()
+
+@app.post("/admin/embeddings/import")
+def admin_embeddings_import(payload: Dict = Body(...)):
+    db = SessionLocal()
+    try:
+        items = payload.get("items") or []
+        # Clear table then insert
+        db.query(EmbeddingRow).delete()
+        for it in items:
+            row = EmbeddingRow(
+                doc_type=it.get("doc_type"),
+                doc_id=it.get("doc_id"),
+                title=it.get("title"),
+                content=it.get("content"),
+                vector=it.get("vector"),
+            )
+            db.add(row)
+        db.commit()
+        return {"imported": len(items)}
+    finally:
+        db.close()
+
+# ------------------- RAG QnA and Route Planning -------------------
+class QnAIn(BaseModel):
+    question: str
+    top_k: int = 5
+    target_lang: Optional[str] = None  # if provided, translate question/answer
+
+class IngestOut(BaseModel):
+    count: int
+
+class RouteIn(BaseModel):
+    question: str
+    duration_minutes: int = 90
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    transport_mode: Optional[str] = "foot"  # foot | bike | car
+
+class RouteStep(BaseModel):
+    title: str
+    description: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    estimated_minutes: int = 10
+
+class RouteOut(BaseModel):
+    steps: List[RouteStep]
+    path: Optional[List[Dict[str, float]]] = None  # [{lat, lng}] polyline of the full route if available
+
+@app.post("/ai/ingest", response_model=IngestOut)
+def ai_ingest():
+    """Build embeddings for Monasteries, Events, Archives into SQLite."""
+    db = SessionLocal()
+    try:
+        # Clear table
+        db.query(EmbeddingRow).delete()
+        db.commit()
+
+        items: List[Dict] = []
+        # Monasteries
+        for m in db.query(Monastery).all():
+            info = m.info
+            text = f"{m.name}. {m.location}. Founded {m.founded}. "
+            if info and info.description:
+                text += info.description
+            items.append({
+                "doc_type": "monastery",
+                "doc_id": m.id,
+                "title": m.name,
+                "content": text,
+            })
+        # Events
+        for e in db.query(Event).all():
+            mon = db.query(Monastery).filter(Monastery.id == e.monastery_id).first()
+            mon_name = mon.name if mon else ""
+            text = f"Event: {e.title}. {e.description}. Date {e.date} {e.time}. Monastery {mon_name}."
+            items.append({
+                "doc_type": "event",
+                "doc_id": e.id,
+                "title": e.title,
+                "content": text,
+            })
+        # Archives
+        for a in db.query(ArchiveItem).all():
+            mon = db.query(Monastery).filter(Monastery.id == a.monastery_id).first()
+            mon_name = mon.name if mon else ""
+            text = f"Archive: {a.title}. {a.description}. Type {a.type}. Monastery {mon_name}."
+            items.append({
+                "doc_type": "archive",
+                "doc_id": a.id,
+                "title": a.title,
+                "content": text,
+            })
+
+        # Compute embeddings if possible
+        vectors: Optional[List[List[float]]]= _openai_embed([it["content"] for it in items])
+        import json as _json
+        for idx, it in enumerate(items):
+            vec = vectors[idx] if vectors and idx < len(vectors) else []
+            row = EmbeddingRow(
+                doc_type=it["doc_type"],
+                doc_id=it["doc_id"],
+                title=it["title"],
+                content=it["content"],
+                vector=_json.dumps(vec),
+            )
+            db.add(row)
+        db.commit()
+        return {"count": len(items)}
+    finally:
+        db.close()
+
+@app.post("/ai/qna")
+def ai_qna(payload: QnAIn):
+    db = SessionLocal()
+    try:
+        import json as _json
+        # Try cache first
+        lang = (payload.target_lang or "en").lower()
+        cache_row = db.query(QaCache).filter(QaCache.question == payload.question, QaCache.lang == lang).first()
+        if cache_row:
+            try:
+                cits = _json.loads(cache_row.citations) if cache_row.citations else []
+            except Exception:
+                cits = []
+            return {"answer": cache_row.answer, "citations": cits}
+
+        # Translate question to English for retrieval if needed
+        retrieval_question = payload.question if lang.startswith("en") else translate_with_openai(payload.question, "en")
+
+        rows = db.query(EmbeddingRow).all()
+        if not rows:
+            raise HTTPException(status_code=400, detail="No embeddings found. Run /ai/ingest first.")
+
+        # Build query vector if possible
+        q_vecs = _openai_embed([retrieval_question])
+        q_vec = q_vecs[0] if q_vecs else None
+
+        scored = []
+        for r in rows:
+            try:
+                vec = _json.loads(r.vector) if r.vector else []
+            except Exception:
+                vec = []
+            if q_vec and vec:
+                score = _cosine(q_vec, vec)
+            else:
+                score = _tf_score(retrieval_question, (r.title or "") + "\n" + (r.content or ""))
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[: max(1, payload.top_k)]
+
+        context_blocks = [f"[{r.doc_type}:{r.doc_id}] {r.title}\n{r.content}" for _, r in top]
+        context = "\n\n".join(context_blocks)
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            try:
+                resp = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "temperature": 0.2,
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful assistant for a monastery visitor app. Answer succinctly and cite sources using the [type:id] labels."},
+                            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {retrieval_question}\n\nAnswer with brief bullet points and cite [type:id]."},
+                        ],
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    answer_en = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    answer = answer_en if lang.startswith("en") else translate_with_openai(answer_en, lang)
+                    citations = [
+                        {"doc_type": r.doc_type, "doc_id": r.doc_id, "title": r.title} for _, r in top
+                    ]
+                    # Save to cache
+                    from datetime import datetime
+                    db.add(QaCache(question=payload.question, lang=lang, answer=answer, citations=_json.dumps(citations), created_at=datetime.utcnow().isoformat()))
+                    db.commit()
+                    return {"answer": answer, "citations": citations}
+            except Exception:
+                pass
+        # Fallback: return top snippets
+        snippet_en = "\n\n".join(context_blocks)
+        answer = snippet_en if lang.startswith("en") else translate_with_openai(snippet_en, lang)
+        citations = [
+            {"doc_type": r.doc_type, "doc_id": r.doc_id, "title": r.title} for _, r in top
+        ]
+        from datetime import datetime
+        db.add(QaCache(question=payload.question, lang=lang, answer=answer, citations=_json.dumps(citations), created_at=datetime.utcnow().isoformat()))
+        db.commit()
+        return {"answer": answer, "citations": citations}
+    finally:
+        db.close()
+
+@app.post("/ai/route", response_model=RouteOut)
+def ai_route(payload: RouteIn):
+    """Greedy nearest-neighbor route:
+    - If start_lat/lng provided, start from there, else from the first monastery with coords.
+    - Estimate walking travel time between points (~12 min per km) and include stop durations (~20 min default each).
+    - Fit within duration_minutes budget.
+    """
+    db = SessionLocal()
+    try:
+        # Pull points with coordinates
+        monasteries = db.query(Monastery).all()
+        mons = []
+        for m in monasteries:
+            lat = m.info.latitude if m.info else None
+            lng = m.info.longitude if m.info else None
+            # Estimate visit duration: prefer highlights sum, else audio intro, else default 20
+            visit_min = 20
+            if m.highlights:
+                total_sec = sum((h.duration_sec or 0) for h in m.highlights)
+                visit_min = max(10, int(round(total_sec / 60)) or 20)
+            elif m.info and m.info.audio_duration_min:
+                visit_min = max(10, int(m.info.audio_duration_min))
+            mons.append({
+                "title": m.name,
+                "desc": (m.info.description if (m.info and m.info.description) else f"Visit {m.name} in {m.location}"),
+                "lat": lat,
+                "lng": lng,
+                "visit_min": visit_min,
+            })
+
+        # Filter those with coords first
+        pts = [p for p in mons if p["lat"] is not None and p["lng"] is not None]
+        if not pts:
+            # Fallback: return a generic step
+            return {"steps": [RouteStep(title="Explore the area", description="Walk around the monastery complex.", estimated_minutes=min(30, payload.duration_minutes))]}
+
+        import math
+        def haversine_km(lat1, lon1, lat2, lon2):
+            R = 6371.0
+            phi1 = math.radians(lat1)
+            phi2 = math.radians(lat2)
+            dphi = math.radians(lat2 - lat1)
+            dl = math.radians(lon2 - lon1)
+            a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            return R * c
+
+        # ------------------- Routing helpers (Google preferred, OSRM fallback) -------------------
+        def _gmaps_mode(mode: str) -> str:
+            m = (mode or "foot").lower()
+            if m in ("foot", "walk", "walking"): return "walking"
+            if m in ("bike", "bicycle", "cycling"): return "bicycling"
+            if m in ("car", "drive", "driving"): return "driving"
+            return "walking"
+
+        def _decode_polyline(encoded: str) -> List[Dict[str, float]]:
+            # Google Encoded Polyline Algorithm Format
+            coords: List[Dict[str, float]] = []
+            if not encoded:
+                return coords
+            index, lat, lng = 0, 0, 0
+            length = len(encoded)
+            while index < length:
+                result, shift = 0, 0
+                while True:
+                    b = ord(encoded[index]) - 63
+                    index += 1
+                    result |= (b & 0x1f) << shift
+                    shift += 5
+                    if b < 0x20:
+                        break
+                dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+                lat += dlat
+
+                result, shift = 0, 0
+                while True:
+                    b = ord(encoded[index]) - 63
+                    index += 1
+                    result |= (b & 0x1f) << shift
+                    shift += 5
+                    if b < 0x20:
+                        break
+                dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+                lng += dlng
+
+                coords.append({"lat": lat / 1e5, "lng": lng / 1e5})
+            return coords
+
+        def google_route_duration_and_geom(a_lat: float, a_lng: float, b_lat: float, b_lng: float, mode: str):
+            """Use Google Directions API to compute duration (minutes) and polyline path.
+            Returns (minutes, path_coords). Requires GOOGLE_MAPS_API_KEY env variable.
+            """
+            api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+            if not api_key:
+                return None
+            try:
+                gmode = _gmaps_mode(mode)
+                url = (
+                    "https://maps.googleapis.com/maps/api/directions/json"
+                    f"?origin={a_lat},{a_lng}&destination={b_lat},{b_lng}&mode={gmode}&key={api_key}"
+                )
+                r = requests.get(url, timeout=15)
+                if r.status_code != 200:
+                    return None
+                data = r.json() or {}
+                routes = data.get("routes") or []
+                if not routes:
+                    return None
+                route0 = routes[0]
+                legs = route0.get("legs") or []
+                seconds = 0
+                for leg in legs:
+                    dur = (leg.get("duration") or {}).get("value", 0)
+                    seconds += int(dur or 0)
+                minutes = max(0, int(round(seconds / 60.0)))
+                enc = (route0.get("overview_polyline") or {}).get("points") or ""
+                path = _decode_polyline(enc) if enc else []
+                return minutes, path
+            except Exception:
+                return None
+
+        # OSRM helpers
+        def _osrm_profile(mode: str):
+            m = (mode or "foot").lower()
+            if m in ("foot", "walk", "walking"):
+                return "foot"
+            if m in ("bike", "bicycle", "cycling"):
+                return "bicycle"
+            if m in ("car", "drive", "driving"):
+                return "driving"
+            return "foot"
+
+        def osrm_route_duration_and_geom(a_lat: float, a_lng: float, b_lat: float, b_lng: float, mode: str):
+            """Returns (minutes, path_coords) using OSRM public server. path_coords is a list of (lat,lng)."""
+            try:
+                profile = _osrm_profile(mode)
+                url = f"https://router.project-osrm.org/route/v1/{profile}/{a_lng},{a_lat};{b_lng},{b_lat}?overview=full&geometries=geojson"
+                r = requests.get(url, timeout=12)
+                if r.status_code == 200:
+                    data = r.json()
+                    routes = (data or {}).get("routes") or []
+                    if routes:
+                        route0 = routes[0]
+                        seconds = route0.get("duration", 0.0) or 0.0
+                        minutes = max(0, int(round(seconds / 60.0)))
+                        coords = route0.get("geometry", {}).get("coordinates", [])
+                        # OSRM returns [lng, lat]
+                        path = [{"lat": float(lat), "lng": float(lng)} for (lng, lat) in coords]
+                        return minutes, path
+            except Exception:
+                pass
+            # Fallback to haversine speed if OSRM fails
+            dist_km = haversine_km(a_lat, a_lng, b_lat, b_lng)
+            prof = _osrm_profile(mode)
+            if prof == "foot":
+                m_per_km = 12  # ~12 min per km
+            elif prof == "bicycle":
+                m_per_km = 3   # ~20 km/h -> 3 min per km
+            else:  # driving
+                m_per_km = 1   # rough fallback
+            minutes = int(round(dist_km * m_per_km))
+            return minutes, []
+
+        def route_duration_and_geom(a_lat: float, a_lng: float, b_lat: float, b_lng: float, mode: str):
+            # Prefer Google if key present
+            g = google_route_duration_and_geom(a_lat, a_lng, b_lat, b_lng, mode)
+            if g:
+                return g
+            # else OSRM
+            return osrm_route_duration_and_geom(a_lat, a_lng, b_lat, b_lng, mode)
+
+        # Establish start position: ALWAYS from fixed Sikkim Station
+        # We ignore any client-provided start_lat/start_lng to keep routes consistent.
+        start_lat = STATION_LAT
+        start_lng = STATION_LNG
+        curr_lat, curr_lng = float(start_lat), float(start_lng)
+
+        remaining = pts.copy()
+        route: List[RouteStep] = []
+        time_left = max(10, payload.duration_minutes)
+        full_path: List[Dict[str, float]] = []
+
+        # Greedy pick next nearest, consume travel time + visit time, until budget exhausts
+        while remaining and time_left > 5:
+            # choose nearest
+            remaining.sort(key=lambda p: haversine_km(curr_lat, curr_lng, float(p["lat"]), float(p["lng"])) )
+            nxt = remaining.pop(0)
+            # Calculate travel based on selected transport mode using Google Directions (if available), else OSRM
+            travel_min, seg_path = route_duration_and_geom(curr_lat, curr_lng, float(nxt["lat"]), float(nxt["lng"]), payload.transport_mode or "foot")
+
+            visit_min = int(nxt["visit_min"]) if nxt.get("visit_min") else 20
+
+            # if first step and start is same as first point, reduce travel
+            dist_km = haversine_km(curr_lat, curr_lng, float(nxt["lat"]), float(nxt["lng"]))
+            if len(route) == 0 and dist_km < 0.05:
+                travel_min = 0
+
+            needed = travel_min + visit_min
+            if needed > time_left:
+                break
+
+            # Add travel as a step if non-zero
+            if travel_min > 0:
+                mode = (_osrm_profile(payload.transport_mode or "foot"))
+                label = "Walk" if mode == "foot" else ("Bike" if mode == "bicycle" else "Drive")
+                route.append(RouteStep(title=label, description=f"{label} to {nxt['title']} (~{dist_km:.2f} km)", lat=None, lng=None, estimated_minutes=travel_min))
+                # Append path geometry if available
+                if seg_path:
+                    # If we already have path, avoid duplicating the starting point
+                    if full_path and seg_path:
+                        seg_path = seg_path[1:]
+                    full_path.extend(seg_path)
+            route.append(RouteStep(title=nxt["title"], description=nxt["desc"], lat=float(nxt["lat"]), lng=float(nxt["lng"]), estimated_minutes=visit_min))
+
+            time_left -= needed
+            curr_lat, curr_lng = float(nxt["lat"]), float(nxt["lng"])
+
+        if not route:
+            # Couldn’t fit any visit; suggest nearest single POI name
+            nearest = min(pts, key=lambda p: haversine_km(curr_lat, curr_lng, float(p["lat"]), float(p["lng"])) )
+            route = [RouteStep(title=nearest["title"], description=nearest["desc"], lat=float(nearest["lat"]), lng=float(nearest["lng"]), estimated_minutes=min(20, time_left))]
+
+        return {"steps": route, "path": full_path or None}
+    finally:
+        db.close()
+
+# ------------------- Admin: QnA Cache -------------------
+class QaCacheEntryOut(BaseModel):
+    id: int
+    question: str
+    lang: str
+    created_at: Optional[str] = None
+
+@app.get("/admin/qa_cache", response_model=List[QaCacheEntryOut])
+def admin_list_qa_cache():
+    db = SessionLocal()
+    try:
+        rows = db.query(QaCache).order_by(QaCache.id.desc()).limit(200).all()
+        return [
+            {
+                "id": r.id,
+                "question": r.question or "",
+                "lang": r.lang or "en",
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+@app.post("/admin/qa_cache/clear")
+def admin_clear_qa_cache():
+    db = SessionLocal()
+    try:
+        deleted = db.query(QaCache).delete()
+        db.commit()
+        return {"deleted": deleted}
+    finally:
+        db.close()
+
 # ------------------- Helpers -------------------
 def serialize_monastery(m: Monastery) -> Dict:
     # media
     media_list = []
     for md in m.media:
-        filename = os.path.basename(md.file_path)
-        file_url = f"http://127.0.0.1:8000/media/{filename}"
-        media_list.append({"title": md.title, "type": md.type, "file_url": file_url})
+        # Guard against null/invalid file paths that can occur from partial seeds
+        filename = os.path.basename(md.file_path) if (getattr(md, "file_path", None)) else ""
+        file_url = f"http://127.0.0.1:8000/media/{filename}" if filename else ""
+        media_list.append({
+            "title": md.title,
+            "type": md.type,
+            "file_url": file_url,
+            "language": getattr(md, "language", None)
+        })
 
     # info
     info = None
@@ -246,6 +771,140 @@ def serialize_monastery(m: Monastery) -> Dict:
         "events": events,
         "archiveItems": archives,
     }
+
+def _pick_edge_voice_for_lang(lang_code: str) -> str:
+    """Basic mapping of language code to an Edge TTS voice. Fallback to en-US if unknown.
+    Note: This is best-effort; update mappings as needed.
+    """
+    lc = (lang_code or "").lower()
+    mapping = {
+        # English
+        "en": "en-US-AriaNeural",
+        "en-us": "en-US-AriaNeural",
+        # Popular Indian languages
+        "hi": "hi-IN-SwaraNeural",        # Hindi
+        "bn": "bn-IN-TanishaaNeural",     # Bengali
+        "mr": "mr-IN-AarohiNeural",       # Marathi
+        "gu": "gu-IN-DeepaNeural",        # Gujarati
+        "ta": "ta-IN-PallaviNeural",      # Tamil
+        "te": "te-IN-ShrutiNeural",       # Telugu
+        "kn": "kn-IN-SapnaNeural",        # Kannada
+        "ml": "ml-IN-SobhanaNeural",      # Malayalam
+        "pa": "pa-IN-GurdeepNeural",      # Punjabi
+        "ur": "ur-PK-UzmaNeural",         # Urdu (Pakistan)
+        # Limited/fallbacks
+        "ne": "en-US-AriaNeural",         # Nepali not broadly available in Edge
+        "bo": "en-US-AriaNeural",         # Tibetan fallback
+    }
+    return mapping.get(lc, mapping.get(lc.split("-")[0], "en-US-AriaNeural"))
+
+# ------------------- TTS Narration (no external API keys required) -------------------
+class NarrateIn(BaseModel):
+    text: str
+    lang: str = "en"  # e.g., 'en', 'hi', 'bn', 'ne'
+    title: Optional[str] = "Narration"
+
+@app.post("/ai/narrate")
+async def ai_narrate(payload: NarrateIn):
+    """Synthesize speech from text using Edge TTS; fallback to gTTS.
+    Returns { file_url } to the generated MP3 under /media.
+    """
+    if not payload.text:
+        raise HTTPException(status_code=400, detail="Missing text")
+    lang = (payload.lang or "en").lower()
+    fname = f"tts_{lang}_{uuid4().hex}.mp3"
+    fpath = os.path.join(MEDIA_ROOT, fname)
+
+    # Try Edge TTS first (neural voices)
+    try:
+        import edge_tts  # type: ignore
+        voice = _pick_edge_voice_for_lang(lang)
+        communicate = edge_tts.Communicate(payload.text, voice=voice)
+        await communicate.save(fpath)
+    except Exception:
+        # Fallback to gTTS (Google client library that works unauthenticated)
+        try:
+            from gtts import gTTS  # type: ignore
+            tts = gTTS(text=payload.text, lang=(lang.split('-')[0] or 'en'))
+            tts.save(fpath)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
+
+    url = f"http://127.0.0.1:8000/media/{fname}"
+    return {"file_url": url, "title": payload.title or "Narration", "lang": lang}
+
+def translate_with_openai(text: str, target_lang: str) -> str:
+    """Translate text to target_lang using OpenAI if available; else return original text.
+    Uses gpt-4o-mini via /chat/completions. This keeps dependencies minimal (requests only).
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or not text or not target_lang:
+        return text
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful translator. Translate the user text faithfully into the requested language without additional commentary."},
+                    {"role": "user", "content": f"Target language: {target_lang}.\nText: {text}"},
+                ],
+                "temperature": 0.2,
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return text
+        data = resp.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", text) or text
+    except Exception:
+        return text
+
+def _openai_embed(texts: List[str]) -> Optional[List[List[float]]]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "text-embedding-3-small",
+                "input": texts,
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return [item.get("embedding", []) for item in data.get("data", [])]
+    except Exception:
+        return None
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    import math
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+def _tf_score(query: str, text: str) -> float:
+    if not query or not text:
+        return 0.0
+    q = query.lower().split()
+    t = text.lower()
+    return sum(t.count(term) for term in q)
 
 # ------------------- CRUD APIs -------------------
 
@@ -337,7 +996,17 @@ def get_monasteries():
     db = SessionLocal()
     try:
         monasteries = db.query(Monastery).all()
-        return [serialize_monastery(m) for m in monasteries]
+        safe_list = []
+        for m in monasteries:
+            try:
+                safe_list.append(serialize_monastery(m))
+            except Exception as e:
+                # Log and skip problematic rows to avoid 500 on list
+                try:
+                    print(f"serialize_monastery error for id={getattr(m, 'id', None)}: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+        return safe_list
     finally:
         db.close()
 
@@ -476,6 +1145,174 @@ async def upload_media(
         db.refresh(media_item)
 
         file_url = f"http://127.0.0.1:8000/media/{fname}"
+        return {"title": media_item.title, "type": media_item.type, "file_url": file_url}
+    finally:
+        db.close()
+
+# ------------------- Multilingual AI Narration -------------------
+@app.post("/monasteries/{monastery_id}/narration_multilingual", response_model=Dict)
+def generate_monastery_narration_multilingual(monastery_id: int, payload: NarrationMultiIn, request: Request = None):
+    db = SessionLocal()
+    try:
+        monastery = db.query(Monastery).filter(Monastery.id == monastery_id).first()
+        if not monastery:
+            raise HTTPException(status_code=404, detail="Monastery not found")
+
+        api_key = os.getenv("OPENAI_API_KEY")
+
+        # Build a default script if none provided (using English base)
+        base_script = payload.script
+        if not base_script:
+            base_script = (
+                f"Welcome to {monastery.name}. Located in {monastery.location}, "
+                f"this monastery was founded in {monastery.founded}. "
+                f"Enjoy this guided audio narration as we explore its history, architecture, and cultural significance."
+            )
+
+        # Translate to target language if needed
+        target_lang = (payload.target_lang or "en").strip()
+        translated = base_script if target_lang.lower().startswith("en") else translate_with_openai(base_script, target_lang)
+
+        # Decide title and voice
+        title = payload.title or f"Audio Narration ({target_lang})"
+        voice = payload.voice
+        if not voice:
+            # Prefer Edge locale-specific voice if OpenAI key is not present; else use alloy with OpenAI
+            voice = _pick_edge_voice_for_lang(target_lang)
+
+        fname = f"{uuid4().hex}.mp3"
+        fpath = os.path.join(MEDIA_ROOT, fname)
+
+        # Synthesize using the same provider chain: OpenAI TTS -> ElevenLabs -> Edge TTS -> gTTS
+        if api_key:
+            tts_payload = {
+                "model": "gpt-4o-mini-tts",
+                "voice": ("alloy" if voice.endswith("Neural") else (voice or "alloy")),
+                "input": translated,
+                "format": "mp3",
+            }
+            try:
+                resp = requests.post(
+                    "https://api.openai.com/v1/audio/speech",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=tts_payload,
+                    timeout=60,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to call TTS service: {e}")
+
+            if resp.status_code != 200:
+                try:
+                    err = resp.json()
+                except Exception:
+                    err = {"message": resp.text}
+                raise HTTPException(status_code=502, detail={"message": "TTS error", "data": err})
+
+            audio_bytes = resp.content
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(audio_bytes)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to save audio: {e}")
+        else:
+            # Fallback provider chain
+            elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
+
+            if elevenlabs_key:
+                try:
+                    elevenlabs_voice = "EXAVITQu4vr4xnSDxMaL"  # default voice id
+                    elevenlabs_payload = {
+                        "text": translated,
+                        "model_id": "eleven_monolingual_v1",
+                        "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
+                    }
+                    headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": elevenlabs_key}
+                    resp = requests.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{elevenlabs_voice}",
+                        json=elevenlabs_payload,
+                        headers=headers,
+                        timeout=60,
+                    )
+                    if resp.status_code == 200:
+                        with open(fpath, "wb") as f:
+                            f.write(resp.content)
+                    else:
+                        raise Exception(f"ElevenLabs API error: {resp.status_code}")
+                except Exception as e:
+                    print(f"ElevenLabs failed, trying Edge TTS: {e}")
+                    try:
+                        import edge_tts  # type: ignore
+
+                        async def synth_edge(text: str, selected_voice: str, out_path: str) -> None:
+                            communicate = edge_tts.Communicate(text, selected_voice)
+                            with open(out_path, "wb") as outfile:
+                                async for chunk in communicate.stream():
+                                    if chunk["type"] == "audio":
+                                        outfile.write(chunk["data"])
+
+                        edge_voice = voice or _pick_edge_voice_for_lang(target_lang)
+                        try:
+                            asyncio.run(synth_edge(translated, edge_voice, fpath))
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                            loop.run_until_complete(synth_edge(translated, edge_voice, fpath))
+                    except Exception:
+                        try:
+                            from gtts import gTTS  # type: ignore
+                        except Exception:
+                            raise HTTPException(status_code=500, detail="Text-to-speech requires OPENAI_API_KEY, ELEVENLABS_API_KEY, edge-tts, or gTTS installed. Install one: pip install edge-tts OR pip install gTTS")
+                        try:
+                            # For gTTS, try to map simple language code
+                            gtts_lang = target_lang.split("-")[0] if target_lang else "en"
+                            tts = gTTS(text=translated, lang=gtts_lang)
+                            tts.save(fpath)
+                        except Exception as e:
+                            raise HTTPException(status_code=500, detail=f"Failed to synthesize audio with gTTS: {e}")
+            else:
+                # Directly try Edge, then gTTS
+                try:
+                    import edge_tts  # type: ignore
+
+                    async def synth_edge(text: str, selected_voice: str, out_path: str) -> None:
+                        communicate = edge_tts.Communicate(text, selected_voice)
+                        with open(out_path, "wb") as outfile:
+                            async for chunk in communicate.stream():
+                                if chunk["type"] == "audio":
+                                    outfile.write(chunk["data"])
+
+                    edge_voice = voice or _pick_edge_voice_for_lang(target_lang)
+                    try:
+                        asyncio.run(synth_edge(translated, edge_voice, fpath))
+                    except RuntimeError:
+                        loop = asyncio.get_event_loop()
+                        loop.run_until_complete(synth_edge(translated, edge_voice, fpath))
+                except Exception:
+                    try:
+                        from gtts import gTTS  # type: ignore
+                    except Exception:
+                        raise HTTPException(status_code=500, detail="Text-to-speech requires OPENAI_API_KEY, ELEVENLABS_API_KEY, edge-tts, or gTTS installed. Install one: pip install edge-tts OR pip install gTTS")
+                    try:
+                        gtts_lang = target_lang.split("-")[0] if target_lang else "en"
+                        tts = gTTS(text=translated, lang=gtts_lang)
+                        tts.save(fpath)
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to synthesize audio with gTTS: {e}")
+
+        media_item = Media(monastery_id=monastery_id, title=title, type="audio", file_path=fpath, language="en")
+        db.add(media_item)
+        db.commit()
+        db.refresh(media_item)
+
+        try:
+            if request is not None:
+                file_url = str(request.url_for("serve_media", filename=fname))
+            else:
+                file_url = f"http://127.0.0.1:8000/media/{fname}"
+        except Exception:
+            file_url = f"http://127.0.0.1:8000/media/{fname}"
         return {"title": media_item.title, "type": media_item.type, "file_url": file_url}
     finally:
         db.close()
@@ -650,7 +1487,13 @@ def generate_monastery_narration(monastery_id: int, payload: NarrationIn, reques
                     except Exception as e:
                         raise HTTPException(status_code=500, detail=f"Failed to synthesize audio with gTTS: {e}")
 
-        media_item = Media(monastery_id=monastery_id, title=title, type="audio", file_path=fpath)
+        media_item = Media(
+            monastery_id=monastery_id,
+            title=title,
+            type="audio",
+            file_path=fpath,
+            language=(target_lang.split('-')[0] if target_lang else None),
+        )
         db.add(media_item)
         db.commit()
         db.refresh(media_item)
