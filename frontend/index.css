@@ -1,0 +1,9 @@
+/* Base styles */
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif; background: #f9fafb; color: #111827; }
+
+/* If Tailwind is configured, these will be processed; otherwise they are harmless */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600&family=Inter:wght@400&display=swap" rel="stylesheet">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <meta name="theme-color" content="#0b1020" />
+    <title>Monastery360</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      (function() {
+        if (!('serviceWorker' in navigator)) return;
+        const isLocal = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+        if (isLocal) {
+          // In dev: actively unregister any existing service workers to avoid stale caches
+          navigator.serviceWorker.getRegistrations().then(regs => {
+            regs.forEach(r => r.unregister().catch(() => {}));
+          }).catch(() => {});
+          // Also attempt to clear caches created by the SW
+          if (window.caches && caches.keys) {
+            caches.keys().then(keys => keys.forEach(k => caches.delete(k).catch(() => {}))).catch(() => {});
+          }
+        } else {
+          // In production: register SW
+          window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js').catch(() => {});
+          });
+        }
+      })();
+    </script>
+    <!-- Voiceflow Chat Widget: update projectID below if needed -->
+    <script type="text/javascript">
+      (function(d, t) {
+          var v = d.createElement(t), s = d.getElementsByTagName(t)[0];
+          v.onload = function() {
+            window.voiceflow.chat.load({
+              verify: { projectID: '68d6abd8c97f2b23db0008e5' },
+              url: 'https://general-runtime.voiceflow.com',
+              versionID: 'development',
+              voice: { url: 'https://runtime-api.voiceflow.com' }
+            });
+          };
+          v.src = 'https://cdn.voiceflow.com/widget-next/bundle.mjs';
+          v.type = 'text/javascript';
+          s.parentNode.insertBefore(v, s);
+      })(document, 'script');
+    </script>
+    <!-- Defensive hide for injected debug/feedback toolbars (e.g., 'Send element') -->
+    <script type="text/javascript">
+      (function() {
+        function hideBars(root) {
+          try {
+            var nodes = root.querySelectorAll('button, a, div, span');
+            nodes.forEach(function(el){
+              var t = (el.textContent || '').toLowerCase();
+              if (t.includes('send element') || t.includes('send console errors')) {
+                el.style.display = 'none';
+              }
+            });
+          } catch (e) {}
+        }
+        var mo = new MutationObserver(function(muts){
+          muts.forEach(function(m){
+            m.addedNodes && m.addedNodes.forEach(function(n){
+              if (n && n.nodeType === 1) hideBars(n);
+            });
+          });
+        });
+        hideBars(document);
+        mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+      })();
+    </script>
+  </body>
+</html>
