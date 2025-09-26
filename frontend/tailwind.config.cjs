@@ -10,6 +10,10 @@ module.exports = {
       colors: {
         background: "#ffffff",
         foreground: "#111827",
+        // Custom brand colors used by TourLanding
+        'brand-dark': '#1a232e',
+        'accent-green': '#7cfb71',
+        'accent-orange': '#fb8a2e',
         primary: {
           DEFAULT: "#0ea5e9",
           foreground: "#ffffff",
@@ -23,6 +27,11 @@ module.exports = {
         ring: "#60a5fa",
         destructive: "#ef4444",
         input: "#e5e7eb",
+      },
+      fontFamily: {
+        // Ensure these utilities exist: font-sans (Inter) and font-montserrat
+        sans: ["Inter", "sans-serif"],
+        montserrat: ["Montserrat", "sans-serif"],
       },
       animation: {
         'fade-in-up': 'fadeInUp 0.8s ease-out forwards',
